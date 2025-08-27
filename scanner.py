@@ -121,12 +121,14 @@ POSITION_SIZING_MODE = os.getenv("POSITION_SIZING_MODE", "risk").lower()  # 'ris
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", 5.0))
 MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", 5.0))
 MAX_NOTIONAL_PERCENT = float(os.getenv("MAX_NOTIONAL_PERCENT", 100.0))
+TARGET_MARGIN_USDT = float(os.getenv("TARGET_MARGIN_USDT", 0.0))  # Hedef marj miktarı
 
 # --- Trade/Runtime ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MIN_SIGNAL_STRENGTH = int(os.getenv("MIN_SIGNAL_STRENGTH", 2))
 MAX_SHORT_POSITIONS = int(os.getenv("MAX_SHORT_POSITIONS", 7))
+MAX_LONG_POSITIONS = int(os.getenv("MAX_LONG_POSITIONS", 7))  # Yön bazlı limit
 MIN_PRICE = float(os.getenv("MIN_PRICE", 0.50))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 900))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", 120))
@@ -977,19 +979,26 @@ class RiskCalculator:
     @staticmethod
     def position_notional(account_balance: float, atr: float, current_price: float) -> float:
         """
-        Yeni boyutlandırma:
-        - POSITION_SIZING_MODE=percent ise: notional = balance * (POSITION_PERCENT/100)
-        - risk ise eski ATR tabanlı hesap
-        Geriye USDT cinsinden notional döndürür.
+        Pozisyon boyutlandırma:
+        1. TARGET_MARGIN_USDT>0 ise: notional = TARGET_MARGIN_USDT × DEFAULT_LEVERAGE
+        2. POSITION_SIZING_MODE=percent ise: notional = balance * (POSITION_PERCENT/100)  
+        3. Aksi halde risk modu (ATR tabanlı)
+        Her durumda güvenlik sınırları uygulanır.
         """
-        if POSITION_SIZING_MODE == "percent":
+        if TARGET_MARGIN_USDT > 0:
+            # Taban marj hedefi modu
+            notional = TARGET_MARGIN_USDT * DEFAULT_LEVERAGE
+        elif POSITION_SIZING_MODE == "percent":
+            # Yüzde modu
             notional = account_balance * (POSITION_PERCENT / 100.0)
-            # Güvenlik sınırları
-            notional = max(notional, MIN_NOTIONAL_USDT)
-            notional = min(notional, account_balance * (MAX_NOTIONAL_PERCENT / 100.0))
-            return notional
-        # default: risk modu
-        return RiskCalculator.calculate_position_size("N/A", atr, current_price, account_balance)
+        else:
+            # Risk modu (eski ATR tabanlı)
+            return RiskCalculator.calculate_position_size("N/A", atr, current_price, account_balance)
+        
+        # Her iki durumda da güvenlik sınırları uygula
+        notional = max(notional, MIN_NOTIONAL_USDT)
+        notional = min(notional, account_balance * (MAX_NOTIONAL_PERCENT / 100.0))
+        return notional
 
 def calc_tp_sl_abs(entry_price: float, atr: float, probability: float, side: str, tick_size: float) -> Tuple[float, float, float]:
     base_multiplier = 1 + (probability * 0.5)
@@ -1185,6 +1194,38 @@ async def get_current_position(symbol: str):
     except Exception as e:
         logger.error(f"{symbol}: Mevcut pozisyon çekilemedi: {e}")
         return 0.0, None, 0.0, 0.0
+    finally:
+        await client.close_connection()
+
+async def count_open_by_side_exchange() -> Dict[str, int]:
+    """
+    Borsadaki gerçek pozisyonları sayar ve long/short yönlerine göre döndürür.
+    Yarış durumlarını önlemek için local sayımlar yerine exchange gerçeğini kullanır.
+    """
+    client = await init_binance_client()
+    if not client:
+        return {"long": 0, "short": 0}
+    
+    try:
+        account = await client.futures_account()
+        positions = account.get("positions", [])
+        
+        long_count = 0
+        short_count = 0
+        
+        for pos in positions:
+            qty = float(pos.get("positionAmt", 0))
+            if abs(qty) > 1e-8:  # Sıfıra yakın değilse aktif pozisyon
+                if qty > 0:
+                    long_count += 1
+                else:
+                    short_count += 1
+                    
+        return {"long": long_count, "short": short_count}
+        
+    except Exception as e:
+        logger.error(f"count_open_by_side_exchange hatası: {e}")
+        return {"long": 0, "short": 0}
     finally:
         await client.close_connection()
 
@@ -2570,6 +2611,15 @@ async def trading_strategy_loop():
                 )
 
                 if side:
+                    # Yön bazlı pozisyon limiti kontrolü (borsa gerçeği)
+                    position_counts = await count_open_by_side_exchange()
+                    if side == "long" and position_counts["long"] >= MAX_LONG_POSITIONS:
+                        logger.info(f"{symbol}: Long pozisyon limiti doldu ({position_counts['long']}/{MAX_LONG_POSITIONS}), sinyal atlandı.")
+                        continue
+                    if side == "short" and position_counts["short"] >= MAX_SHORT_POSITIONS:
+                        logger.info(f"{symbol}: Short pozisyon limiti doldu ({position_counts['short']}/{MAX_SHORT_POSITIONS}), sinyal atlandı.")
+                        continue
+                        
                     account_balance = await get_futures_balance()
                     _ = RiskCalculator.calculate_position_size(symbol, float(atr_arr[-1]), float(close[-1]), account_balance)
                     await open_position(
